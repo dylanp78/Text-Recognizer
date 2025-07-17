@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser OCR from PDF</title>
+    <script src='https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'></script>
+    <script src="https://mozilla.github.io/pdf.js/build/pdf.mjs" type="module"></script>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f0f2f5;
+            color: #1c1e21;
+            margin: 0;
+            padding: 1vw;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow: hidden; /* Prevent body scroll */
+        }
+        h1 {
+            text-align: center;
+        }
+        #controls {
+            padding: 15px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background-color: #fff;
+            margin-bottom: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #pagination button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            background-color: #e9ecef;
+            cursor: pointer;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        #pagination button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        #main-container {
+            display: flex;
+            gap: 20px;
+            width: 100%;
+            height: 80vh;
+        }
+        #viewer-container {
+            flex: 3;
+            border: 1px solid #333;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+            overflow: auto;
+            background-color: #525659;
+        }
+        #results-container {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+        }
+        #canvas-wrapper {
+            position: relative;
+            width: fit-content;
+            margin: auto;
+        }
+        #pdf-canvas, #selection-canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        #selection-canvas {
+            cursor: crosshair;
+        }
+        #selection-canvas.panning {
+            cursor: grab;
+        }
+        #result-text {
+            width: 100%;
+            flex-grow: 1;
+            font-size: 14px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 10px;
+            box-sizing: border-box;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>PDF Text Extractor</h1>
+    <div id="controls">
+        <label for="file-input">Choose a PDF file:</label>
+        <input type="file" id="file-input" accept=".pdf">
+        <div id="pagination">
+            <button id="prev-page" title="Previous Page">◄</button>
+            <span id="page-indicator">Page: <span id="page-num">0</span> / <span id="page-count">0</span></span>
+            <button id="next-page" title="Next Page">►</button>
+        </div>
+         <small>(Hold 'Alt' + Scroll to Zoom, Hold 'Alt' + Drag to Pan)</small>
+    </div>
+
+    <div id="main-container">
+        <div id="viewer-container">
+            <div id="canvas-wrapper">
+                <canvas id="pdf-canvas"></canvas>
+                <canvas id="selection-canvas"></canvas>
+            </div>
+        </div>
+        <div id="results-container">
+            <h2>Extracted Text</h2>
+            <textarea id="result-text" placeholder="Draw a box on the document to extract text..."></textarea>
+        </div>
+    </div>
+
+    <script type="module">
+        const fileInput = document.getElementById('file-input');
+        const viewerContainer = document.getElementById('viewer-container');
+        const pdfCanvas = document.getElementById('pdf-canvas');
+        const selectionCanvas = document.getElementById('selection-canvas');
+        const resultTextEl = document.getElementById('result-text');
+        const pageNumEl = document.getElementById('page-num');
+        const pageCountEl = document.getElementById('page-count');
+        const prevPageBtn = document.getElementById('prev-page');
+        const nextPageBtn = document.getElementById('next-page');
+
+        const { pdfjsLib } = globalThis;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = `https://mozilla.github.io/pdf.js/build/pdf.worker.mjs`;
+
+        let pdfDoc = null;
+        let pageNum = 1;
+        let pageRendering = false;
+        let currentScale = 1.0;
+        let highResCanvas = document.createElement('canvas');
+        let cacheUpdateTimeout = null;
+
+        let isSelecting = false;
+        let isPanning = false;
+        let selectionRect = {};
+        let lastPanX, lastPanY;
+
+        const pdfCtx = pdfCanvas.getContext('2d');
+        const selectionCtx = selectionCanvas.getContext('2d');
+
+        async function renderVisiblePage(page, scale) {
+            const viewport = page.getViewport({ scale: scale });
+            pdfCanvas.height = viewport.height;
+            pdfCanvas.width = viewport.width;
+            selectionCanvas.height = viewport.height;
+            selectionCanvas.width = viewport.width;
+            await page.render({ canvasContext: pdfCtx, viewport: viewport }).promise;
+        }
+
+        async function updateHighResCache(page) {
+            const OCR_SCALE = 3.0;
+            const ocrViewport = page.getViewport({ scale: OCR_SCALE });
+            highResCanvas.width = ocrViewport.width;
+            highResCanvas.height = ocrViewport.height;
+            await page.render({ canvasContext: highResCanvas.getContext('2d'), viewport: ocrViewport }).promise;
+        }
+
+        async function renderPageAndCache(num, newScale) {
+            if (pageRendering) return;
+            pageRendering = true;
+            if (newScale) currentScale = newScale;
+
+            pageNumEl.textContent = num;
+            const page = await pdfDoc.getPage(num);
+            await renderVisiblePage(page, currentScale);
+            await updateHighResCache(page);
+            pageRendering = false;
+        }
+
+        fileInput.addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            const fileReader = new FileReader();
+            fileReader.onload = async (e) => {
+                pdfDoc = await pdfjsLib.getDocument({ data: new Uint8Array(e.target.result) }).promise;
+                pageCountEl.textContent = pdfDoc.numPages;
+                pageNum = 1;
+                const page = await pdfDoc.getPage(1);
+                const initialScale = viewerContainer.clientWidth / page.getViewport({scale: 1}).width * 0.98;
+                await renderPageAndCache(pageNum, initialScale);
+            };
+            fileReader.readAsArrayBuffer(file);
+        });
+
+        prevPageBtn.addEventListener('click', async () => { if (pageNum > 1) { pageNum--; await renderPageAndCache(pageNum); } });
+        nextPageBtn.addEventListener('click', async () => { if (pageNum < pdfDoc.numPages) { pageNum++; await renderPageAndCache(pageNum); } });
+        
+        selectionCanvas.addEventListener('mousedown', (e) => {
+            if (!pdfDoc || pageRendering) return;
+            if (e.altKey) {
+                isPanning = true;
+                selectionCanvas.classList.add('panning');
+                lastPanX = e.clientX;
+                lastPanY = e.clientY;
+            } else {
+                isSelecting = true;
+                selectionRect.startX = e.offsetX;
+                selectionRect.startY = e.offsetY;
+            }
+        });
+
+        selectionCanvas.addEventListener('mousemove', (e) => {
+            if (isPanning) {
+                viewerContainer.scrollLeft -= e.clientX - lastPanX;
+                viewerContainer.scrollTop -= e.clientY - lastPanY;
+                lastPanX = e.clientX;
+                lastPanY = e.clientY;
+            } else if (isSelecting) {
+                selectionCtx.clearRect(0, 0, selectionCanvas.width, selectionCanvas.height);
+                selectionCtx.fillStyle = 'rgba(0, 123, 255, 0.3)';
+                selectionCtx.fillRect(selectionRect.startX, selectionRect.startY, e.offsetX - selectionRect.startX, e.offsetY - selectionRect.startY);
+            }
+        });
+
+        window.addEventListener('mouseup', (e) => {
+            if (isPanning || isSelecting) {
+                if (isPanning) selectionCanvas.classList.remove('panning');
+                isPanning = false;
+                if(isSelecting) {
+                     isSelecting = false;
+                     selectionCtx.clearRect(0, 0, selectionCanvas.width, selectionCanvas.height);
+                     performOcr(e.offsetX, e.offsetY);
+                }
+            }
+        });
+        
+        // --- REWRITTEN: Zoom logic is now more robust ---
+        viewerContainer.addEventListener('wheel', (e) => {
+            if (!pdfDoc || !e.altKey) return;
+            e.preventDefault();
+
+            const zoomFactor = 1.03;
+            const oldScale = currentScale;
+            currentScale = e.deltaY < 0 ? oldScale * zoomFactor : oldScale / zoomFactor;
+
+            // Get mouse position relative to the pdfCanvas
+            const canvasRect = pdfCanvas.getBoundingClientRect();
+            const mouseXOnCanvas = e.clientX - canvasRect.left;
+            const mouseYOnCanvas = e.clientY - canvasRect.top;
+
+            // Debounce and smooth zoom rendering
+            if (window._zoomRaf) cancelAnimationFrame(window._zoomRaf);
+            if (window._zoomTimeout) clearTimeout(window._zoomTimeout);
+
+            window._zoomRaf = requestAnimationFrame(() => {
+                window._zoomTimeout = setTimeout(() => {
+                    pdfDoc.getPage(pageNum).then(page => {
+                        renderVisiblePage(page, currentScale).then(() => {
+                            const newMouseXOnCanvas = mouseXOnCanvas * (currentScale / oldScale);
+                            const newMouseYOnCanvas = mouseYOnCanvas * (currentScale / oldScale);
+
+                            // Find the canvas wrapper's position relative to the scroll container
+                            const wrapperRect = pdfCanvas.parentElement.getBoundingClientRect();
+                            const viewerRect = viewerContainer.getBoundingClientRect();
+                            const offsetX = wrapperRect.left - viewerRect.left + viewerContainer.scrollLeft;
+                            const offsetY = wrapperRect.top - viewerRect.top + viewerContainer.scrollTop;
+
+                            // Set scroll so the point under the mouse stays under the mouse
+                            viewerContainer.scrollLeft = offsetX + newMouseXOnCanvas - (e.clientX - viewerRect.left);
+                            viewerContainer.scrollTop = offsetY + newMouseYOnCanvas - (e.clientY - viewerRect.top);
+
+                            clearTimeout(cacheUpdateTimeout);
+                            cacheUpdateTimeout = setTimeout(() => {
+                                updateHighResCache(page);
+                            }, 300);
+                        });
+                    });
+                }, 10); // 10ms debounce for smoothness
+            });
+        }, { passive: false });
+
+        async function performOcr(endX, endY) {
+            const OCR_SCALE = 3.0;
+            const scaleFactor = OCR_SCALE / currentScale;
+            const rect = {
+                left: Math.min(selectionRect.startX, endX) * scaleFactor,
+                top: Math.min(selectionRect.startY, endY) * scaleFactor,
+                width: Math.abs(endX - selectionRect.startX) * scaleFactor,
+                height: Math.abs(endY - selectionRect.startY) * scaleFactor
+            };
+            
+            if (rect.width < 5 || rect.height < 5) return;
+
+            // Create canvas for the selected region
+            const snippetCanvas = document.createElement('canvas');
+            snippetCanvas.width = rect.width;
+            snippetCanvas.height = rect.height;
+            const ctx = snippetCanvas.getContext('2d');
+            ctx.drawImage(highResCanvas, rect.left, rect.top, rect.width, rect.height, 0, 0, rect.width, rect.height);
+            
+            // Process the image to enhance text and reduce graphics/lines
+            const processedCanvas = document.createElement('canvas');
+            processedCanvas.width = rect.width;
+            processedCanvas.height = rect.height;
+            const processedCtx = processedCanvas.getContext('2d');
+            
+            // Get image data for processing
+            const imageData = ctx.getImageData(0, 0, rect.width, rect.height);
+            const data = imageData.data;
+            
+            // Apply image processing to enhance text and reduce graphics
+            // Increase contrast and convert to black and white with threshold
+            for (let i = 0; i < data.length; i += 4) {
+                // Calculate grayscale using luminance formula
+                const brightness = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                
+                // Apply threshold to create black/white (better for text recognition)
+                const threshold = 160;
+                const val = brightness > threshold ? 255 : 0;
+                
+                // Set RGB values to create black/white image
+                data[i] = val;     // Red
+                data[i + 1] = val; // Green
+                data[i + 2] = val; // Blue
+            }
+            
+            // Put processed image back to canvas
+            processedCtx.putImageData(imageData, 0, 0);
+            
+            // Create the Tesseract worker
+            const worker = await Tesseract.createWorker('eng');
+            
+            await worker.setParameters({
+                // Use SPARSE_TEXT instead of SINGLE_BLOCK to better identify text among graphics
+                tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+                
+                // Improve character whitelist while keeping special characters needed for most documents
+                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,;:"\'-_—–()[]{}!?@#$%&*/=+<>|',
+                
+                // Set confidence threshold - ignore results with lower confidence
+                tessedit_min_confidence: 60,
+                
+                // Assume the image is mostly text (reject graphics)
+                textord_min_linesize: 2.5,
+                
+                // Improve line finding to distinguish from graphics
+                textord_tabfind_vertical_text: 0
+            });
+            
+            // Run OCR on the processed image
+            const { data: { text } } = await worker.recognize(processedCanvas);
+            
+            // Display the result without confidence score
+            resultTextEl.value = text.trim();
+            await navigator.clipboard.writeText(text.trim());
+            await worker.terminate();
+        }
+    </script>
+</body>
+</html>
